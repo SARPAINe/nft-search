@@ -1,0 +1,93 @@
+# Full stack for "Path A". `docker compose up -d` brings everything online:
+#   - postgres (with tuned config, pg_trgm extension via init SQL)
+#   - backend  (node, prisma, raw-SQL FTS)
+#   - frontend (nginx serving the SPA, reverse-proxying API calls to backend)
+#
+# Optional pgAdmin lives behind a `tools` profile so it's only started
+# when the user explicitly asks:  `docker compose --profile tools up -d`
+#
+# All configurable values have inline ${VAR:-default} fallbacks so the
+# file works with NO external env file. If you want to override any of
+# them in a deployment, set the variables in the shell (or pass
+# `--env-file path/to/file` to compose) — not via a checked-in .env.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: nft_search_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-nftuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nftpass}
+      POSTGRES_DB:       ${POSTGRES_DB:-nftmarket}
+    ports:
+      # Host port defaults to 5433 to avoid clashing with a local Postgres
+      # often listening on 5432. Override with POSTGRES_HOST_PORT=… if needed.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./backend/src/db/migrations:/docker-entrypoint-initdb.d:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nftuser} -d ${POSTGRES_DB:-nftmarket}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nft_search_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV:     production
+      PORT:         "4000"
+      # Inside the compose network the DB hostname is the service name.
+      # Internal Postgres port stays 5432; the host-side 5433 mapping
+      # is irrelevant from container-to-container.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nftuser}:${POSTGRES_PASSWORD:-nftpass}@postgres:5432/${POSTGRES_DB:-nftmarket}?schema=public
+      JWT_SECRET:   ${JWT_SECRET:-dev-only-jwt-secret-please-rotate-in-real-deployments-xxxxxxxxxx}
+      API_KEY:      ${API_KEY:-dev-only-api-key-please-rotate}
+      # Frontend container reaches the API via same-origin, so the only
+      # CORS-relevant origin is the host-mapped frontend URL (browser).
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${FRONTEND_HOST_PORT:-5173}}
+    ports:
+      - "${BACKEND_HOST_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nft_search_frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_HOST_PORT:-5173}:80"
+    depends_on:
+      - backend
+
+  # Optional admin UI. Start with: docker compose --profile tools up -d pgadmin
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: nft_search_pgadmin
+    restart: unless-stopped
+    environment:
+      # pgAdmin 8+ rejects TLDs like .local/.test even with deliverability
+      # checks off — use a real-looking TLD.
+      PGADMIN_DEFAULT_EMAIL:    ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_HOST_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - tools
+
+volumes:
+  pgdata:
